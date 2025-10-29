@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Python virtual environments
+houseParser/.venv/
+
+# Docker/Postgres data directory
+houseParser/db-data/
+
+# Downloaded samples and generated outputs
+houseParser/samples/
