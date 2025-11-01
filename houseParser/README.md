@@ -2,6 +2,7 @@
 
 ## 1. Create a Virtual Environment
 ```bash
+conda deactivate # exit environment if inside another environment
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 ```
@@ -55,8 +56,14 @@ python house_ptr_scraper.py 2025 --db-url postgresql://tlp:tlp_password@localhos
   python house_ptr_scraper.py 2023 2024 2025 \
     --db-url postgresql://tlp:tlp_password@localhost:5432/tlp_house
   ```
+- Download PDFs for non-`P` filings (saved to `samples/<year>/filings/<DocID>.pdf`):
+  ```bash
+  python house_ptr_scraper.py 2025 \
+    --db-url postgresql://tlp:tlp_password@localhost:5432/tlp_house \
+    --download-pdfs
+  ```
 
-Outputs are saved to `samples/<year>/<year>FD.zip` and optional JSON/CSV files beside the ZIP. Parsed rows are upserted into the `house_filings` table.
+Outputs are saved to `samples/<year>/<year>FD.zip`, optional JSON/CSV alongside the ZIP, and (when enabled) PDFs under `samples/<year>/filings/`. Parsed rows are upserted into the `house_filings` table.
 
 Verify data:
 ```bash

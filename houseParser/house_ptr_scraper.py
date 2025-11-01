@@ -5,6 +5,7 @@ Downloader and parser for U.S. House financial disclosure ZIP archives.
 - Downloads yearly ZIPs (e.g. 2025FD.zip) into houseParser/samples/<year>/
 - Parses the XML payload (ignoring the TXT companion file)
 - Optionally persists filings into the local Postgres database
+- Optional PDF downloader for non-P filing types
 """
 from __future__ import annotations
 
@@ -23,6 +24,10 @@ import requests
 from dotenv import load_dotenv
 
 DEFAULT_BASE_URL = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
+DEFAULT_PDF_URL = (
+    "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}/{doc_id}.pdf"
+)
+PDF_SKIP_TYPES = {"P"}
 
 
 @dataclass
@@ -117,6 +122,16 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("DATABASE_URL"),
         help="Postgres connection string; defaults to DATABASE_URL env variable.",
     )
+    parser.add_argument(
+        "--download-pdfs",
+        action="store_true",
+        help="Download available filing PDFs (skips filing type P).",
+    )
+    parser.add_argument(
+        "--pdf-base-url",
+        default=DEFAULT_PDF_URL,
+        help="Template for filing PDF URLs (default: %(default)s).",
+    )
     return parser.parse_args()
 
 
@@ -140,6 +155,16 @@ def main() -> None:
             continue
 
         emit_output(result, args.output)
+
+        if args.download_pdfs:
+            download_filing_pdfs(
+                result=result,
+                session=session,
+                pdf_base_url=args.pdf_base_url,
+                skip_types=PDF_SKIP_TYPES,
+            )
+        else:
+            logging.info("Skipping PDF downloads; pass --download-pdfs to enable.")
 
         if args.db_url:
             persist_filings(result.filings, args.db_url)
@@ -182,6 +207,15 @@ def build_year_url(template_or_prefix: str, year: int) -> str:
 
 
 def download_zip(url: str, destination: Path, session: requests.Session) -> None:
+    response = session.get(url, stream=True, timeout=30)
+    response.raise_for_status()
+    with destination.open("wb") as fh:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                fh.write(chunk)
+
+
+def download_file(url: str, destination: Path, session: requests.Session) -> None:
     response = session.get(url, stream=True, timeout=30)
     response.raise_for_status()
     with destination.open("wb") as fh:
@@ -362,6 +396,61 @@ def persist_filings(filings: Iterable[FilingRow], db_url: str) -> None:
                 """,
                 [filing.to_db_params() for filing in filings],
             )
+
+
+def download_filing_pdfs(
+    result: ParseResult,
+    session: requests.Session,
+    pdf_base_url: str,
+    skip_types: set[str],
+) -> None:
+    filings_dir = result.zip_path.parent / "filings"
+    filings_dir.mkdir(exist_ok=True)
+
+    total_attempts = 0
+    downloaded = 0
+    skipped = 0
+    failures = 0
+
+    for filing in result.filings:
+        filing_type = (filing.filing_type or "").upper()
+        if filing_type in skip_types:
+            skipped += 1
+            continue
+
+        doc_id = filing.doc_id
+        if not doc_id:
+            skipped += 1
+            continue
+
+        pdf_path = filings_dir / f"{doc_id}.pdf"
+        if pdf_path.exists():
+            continue
+
+        url = pdf_base_url.format(year=result.year, doc_id=doc_id)
+        total_attempts += 1
+        try:
+            download_file(url, pdf_path, session)
+            downloaded += 1
+        except requests.HTTPError as exc:
+            failures += 1
+            logging.warning(
+                "HTTP error downloading PDF %s (%s): %s", doc_id, filing_type, exc
+            )
+        except requests.RequestException as exc:
+            failures += 1
+            logging.warning(
+                "Request error downloading PDF %s (%s): %s", doc_id, filing_type, exc
+            )
+
+    logging.info(
+        "PDF download summary for %s: attempted=%s, saved=%s, skipped=%s, failures=%s",
+        result.year,
+        total_attempts,
+        downloaded,
+        skipped,
+        failures,
+    )
 
 
 if __name__ == "__main__":

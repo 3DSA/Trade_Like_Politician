@@ -3,6 +3,7 @@
 
 # Python virtual environments
 houseParser/.venv/
+.venv/
 
 # Docker/Postgres data directory
 houseParser/db-data/
