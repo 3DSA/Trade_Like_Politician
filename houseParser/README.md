@@ -56,7 +56,7 @@ python house_ptr_scraper.py 2025 --db-url postgresql://tlp:tlp_password@localhos
   python house_ptr_scraper.py 2023 2024 2025 \
     --db-url postgresql://tlp:tlp_password@localhost:5432/tlp_house
   ```
-- Download PDFs for non-`P` filings (saved to `samples/<year>/filings/<DocID>.pdf`):
+- Download PDFs (financial filings + PTRs saved to `samples/<year>/filings/<DocID>.pdf`):
   ```bash
   python house_ptr_scraper.py 2025 \
     --db-url postgresql://tlp:tlp_password@localhost:5432/tlp_house \

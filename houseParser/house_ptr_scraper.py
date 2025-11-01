@@ -27,7 +27,9 @@ DEFAULT_BASE_URL = "https://disclosures-clerk.house.gov/public_disc/financial-pd
 DEFAULT_PDF_URL = (
     "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}/{doc_id}.pdf"
 )
-PDF_SKIP_TYPES = {"P"}
+DEFAULT_PTR_PDF_URL = (
+    "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
+)
 
 
 @dataclass
@@ -125,12 +127,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--download-pdfs",
         action="store_true",
-        help="Download available filing PDFs (skips filing type P).",
+        help="Download available filing PDFs (falls back to PTR URL for type P).",
     )
     parser.add_argument(
         "--pdf-base-url",
         default=DEFAULT_PDF_URL,
         help="Template for filing PDF URLs (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--ptr-pdf-base-url",
+        default=DEFAULT_PTR_PDF_URL,
+        help="Template for PTR filing PDF URLs (default: %(default)s).",
     )
     return parser.parse_args()
 
@@ -161,7 +168,7 @@ def main() -> None:
                 result=result,
                 session=session,
                 pdf_base_url=args.pdf_base_url,
-                skip_types=PDF_SKIP_TYPES,
+                ptr_pdf_base_url=args.ptr_pdf_base_url,
             )
         else:
             logging.info("Skipping PDF downloads; pass --download-pdfs to enable.")
@@ -402,7 +409,7 @@ def download_filing_pdfs(
     result: ParseResult,
     session: requests.Session,
     pdf_base_url: str,
-    skip_types: set[str],
+    ptr_pdf_base_url: str,
 ) -> None:
     filings_dir = result.zip_path.parent / "filings"
     filings_dir.mkdir(exist_ok=True)
@@ -414,10 +421,6 @@ def download_filing_pdfs(
 
     for filing in result.filings:
         filing_type = (filing.filing_type or "").upper()
-        if filing_type in skip_types:
-            skipped += 1
-            continue
-
         doc_id = filing.doc_id
         if not doc_id:
             skipped += 1
@@ -427,7 +430,10 @@ def download_filing_pdfs(
         if pdf_path.exists():
             continue
 
-        url = pdf_base_url.format(year=result.year, doc_id=doc_id)
+        if filing_type == "P":
+            url = ptr_pdf_base_url.format(year=result.year, doc_id=doc_id)
+        else:
+            url = pdf_base_url.format(year=result.year, doc_id=doc_id)
         total_attempts += 1
         try:
             download_file(url, pdf_path, session)
