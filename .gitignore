@@ -3,10 +3,13 @@
 
 # Python virtual environments
 houseParser/.venv/
+senateParser/.venv/
 .venv/
 
 # Docker/Postgres data directory
 houseParser/db-data/
+senateParser/db-data/
 
 # Downloaded samples and generated outputs
 houseParser/samples/
+senateParser/samples/

@@ -1,0 +1,17 @@
+# Basic Postgres service for local development
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+services:
+  postgres:
+    image: postgres:16
+    container_name: tlp-senate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tlp
+      POSTGRES_PASSWORD: tlp_password
+      POSTGRES_DB: tlp_senate
+    ports:
+      - "5433:5432"  # Note: Using 5433 to avoid conflict with House Parser DB
+    volumes:
+      - ./db-data:/var/lib/postgresql/data
