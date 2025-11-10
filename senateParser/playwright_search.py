@@ -140,31 +140,67 @@ def run_search(start_date: str, end_date: str):
                     logging.exception("Failed to fill date inputs in UI")
 
                 # Click the search button and wait for the XHR/response
-                logging.info("Clicking search submit and waiting for XHR response")
-                try:
-                    with page.expect_response(lambda r: "/report/data/" in r.url and r.request.method == "POST") as resp_info:
-                        # Click the primary search button
-                        if page.locator("button.btn-primary[type='submit']").count():
-                                page.locator("button.btn-primary[type='submit']").first.click()
-                        else:
-                            page.click("button[type='submit']")
-                    resp = resp_info.value
-                    text = resp.text()
-                    # Save the raw JSON
-                    try:
-                        with open("debug_results_json.json", "w", encoding="utf-8") as fh:
-                            fh.write(text)
-                    except Exception:
-                        pass
+                # NOTE: XHR interception disabled to force fallback path with full pagination
+                # The XHR path only captures the first page and is too slow (visits each filing page)
+                # To re-enable XHR interception, change ENABLE_XHR_INTERCEPTION to True
+                ENABLE_XHR_INTERCEPTION = False
 
-                    data = None
+                if ENABLE_XHR_INTERCEPTION:
+                    logging.info("Clicking search submit and waiting for XHR response (first page only)")
                     try:
-                        data = resp.json().get("data")
-                    except Exception:
-                        logging.error("Response not JSON or missing 'data' key from XHR")
+                        with page.expect_response(lambda r: "/report/data/" in r.url and r.request.method == "POST") as resp_info:
+                            # Click the primary search button
+                            if page.locator("button.btn-primary[type='submit']").count():
+                                    page.locator("button.btn-primary[type='submit']").first.click()
+                            else:
+                                page.click("button[type='submit']")
+                        resp = resp_info.value
+                        text = resp.text()
+                        # Save the raw JSON
+                        try:
+                            with open("debug_results_json.json", "w", encoding="utf-8") as fh:
+                                fh.write(text)
+                        except Exception:
+                            pass
 
-                    rows = []
-                    if data:
+                        data = None
+                        total_records = None
+                        try:
+                            json_response = resp.json()
+                            data = json_response.get("data")
+                            total_records = json_response.get("recordsTotal", 0)
+                            if total_records:
+                                logging.warning("XHR captured first page only: showing %d of %d total filings (pagination not implemented in XHR path)",
+                                              len(data) if data else 0, total_records)
+                        except Exception:
+                            logging.error("Response not JSON or missing 'data' key from XHR")
+
+                        rows = []
+                        if data:
+                            for item in data:
+                                text_frag = ""
+                                if isinstance(item, str):
+                                    text_frag = item
+                                elif isinstance(item, list):
+                                    text_frag = " ".join([str(x) for x in item])
+                                elif isinstance(item, dict):
+                                    text_frag = " ".join([str(v) for v in item.values()])
+
+                                # Prefer extracting an href attribute if present in the row HTML
+                                href_m = re.search(r'href="([^"]+)"', text_frag)
+                                href = href_m.group(1) if href_m else None
+
+                                # Extract a date if present
+                                date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
+                                date_text = date_match.group(1) if date_match else None
+
+                                rows.append({"href": href, "filing_date": date_text, "raw": {"text": text_frag}})
+
+                        logging.info("Found %d filings via intercepted XHR", len(rows))
+
+                        # Parse the XHR data and extract filing info
+                        # Data is array of arrays: [firstName, lastName, fullName, linkHTML, date]
+                        enriched = []
                         for item in data:
                             text_frag = ""
                             if isinstance(item, str):
@@ -174,74 +210,127 @@ def run_search(start_date: str, end_date: str):
                             elif isinstance(item, dict):
                                 text_frag = " ".join([str(v) for v in item.values()])
 
-                            # Prefer extracting an href attribute if present in the row HTML
+                            # Extract href and doc_id
                             href_m = re.search(r'href="([^"]+)"', text_frag)
                             href = href_m.group(1) if href_m else None
 
-                            # Extract a date if present
+                            doc_id = None
+                            html_content = None
+                            if href and "/ptr/" in href:
+                                doc_id_m = re.search(r"/ptr/([^/\"]+)", href)
+                                doc_id = doc_id_m.group(1) if doc_id_m else None
+
+                                # Fetch HTML from the view page
+                                if doc_id:
+                                    try:
+                                        view_url = href if href.startswith("http") else (BASE_URL + href)
+                                        logging.info("Visiting view page: %s", view_url)
+                                        page.goto(view_url, timeout=30000)
+                                        page.wait_for_load_state("networkidle", timeout=30000)
+
+                                        # Get HTML content
+                                        html_content = page.content()
+                                        logging.info("Fetched HTML for doc_id: %s (%d bytes)", doc_id, len(html_content))
+                                    except Exception:
+                                        logging.exception("Failed to fetch HTML for %s", doc_id)
+
+                            # Extract date
                             date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
                             date_text = date_match.group(1) if date_match else None
 
-                            rows.append({"href": href, "filing_date": date_text, "raw": {"text": text_frag}})
-
-                    logging.info("Found %d filings via intercepted XHR", len(rows))
-
-                    # Parse the XHR data and extract filing info
-                    # Data is array of arrays: [firstName, lastName, fullName, linkHTML, date]
-                    enriched = []
-                    for item in data:
-                        text_frag = ""
-                        if isinstance(item, str):
-                            text_frag = item
-                        elif isinstance(item, list):
-                            text_frag = " ".join([str(x) for x in item])
-                        elif isinstance(item, dict):
-                            text_frag = " ".join([str(v) for v in item.values()])
-
-                        # Extract href and doc_id
-                        href_m = re.search(r'href="([^"]+)"', text_frag)
-                        href = href_m.group(1) if href_m else None
-
-                        doc_id = None
-                        html_content = None
-                        if href and "/ptr/" in href:
-                            doc_id_m = re.search(r"/ptr/([^/\"]+)", href)
-                            doc_id = doc_id_m.group(1) if doc_id_m else None
-
-                            # Fetch HTML from the view page
                             if doc_id:
-                                try:
-                                    view_url = href if href.startswith("http") else (BASE_URL + href)
-                                    logging.info("Visiting view page: %s", view_url)
-                                    page.goto(view_url, timeout=30000)
-                                    page.wait_for_load_state("networkidle", timeout=30000)
+                                view_url_full = href if href.startswith("http") else (BASE_URL + href)
+                                enriched.append({
+                                    "doc_id": doc_id,
+                                    "href": href,
+                                    "filing_date": date_text,
+                                    "html_content": html_content,
+                                    "source_url": view_url_full,
+                                    "raw": {"text": text_frag}
+                                })
 
-                                    # Get HTML content
-                                    html_content = page.content()
-                                    logging.info("Fetched HTML for doc_id: %s (%d bytes)", doc_id, len(html_content))
-                                except Exception:
-                                    logging.exception("Failed to fetch HTML for %s", doc_id)
+                        cookies = page.context.cookies()
+                        browser.close()
+                        return enriched, cookies
+                    except Exception:
+                        logging.exception("Failed to intercept XHR; falling back to server-side POST")
+                else:
+                    logging.info("XHR interception disabled, using UI pagination by clicking through pages")
 
-                        # Extract date
-                        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
-                        date_text = date_match.group(1) if date_match else None
+                    # Click search to trigger the initial results
+                    if page.locator("button.btn-primary[type='submit']").count():
+                        page.locator("button.btn-primary[type='submit']").first.click()
+                    else:
+                        page.click("button[type='submit']")
 
-                        if doc_id:
-                            view_url_full = href if href.startswith("http") else (BASE_URL + href)
-                            enriched.append({
-                                "doc_id": doc_id,
-                                "href": href,
-                                "filing_date": date_text,
-                                "html_content": html_content,
-                                "source_url": view_url_full,
-                                "raw": {"text": text_frag}
-                            })
+                    page.wait_for_load_state("networkidle")
+                    logging.info("Initial search results loaded")
 
+                    # Now scrape all pages by clicking Next
+                    all_rows = []
+                    page_num = 1
+
+                    while True:
+                        logging.info("Scraping page %d...", page_num)
+
+                        # Wait for DataTable to load
+                        page.wait_for_timeout(2000)
+
+                        # Extract all rows from current page
+                        try:
+                            # DataTable rows are in <tbody> with <tr> elements
+                            table_rows = page.locator("#filedReports tbody tr")
+                            row_count = table_rows.count()
+                            logging.info("Found %d rows on page %d", row_count, page_num)
+
+                            for i in range(row_count):
+                                row = table_rows.nth(i)
+                                # Get all text content from the row
+                                row_text = row.inner_text()
+
+                                # Look for PTR links in the row
+                                links = row.locator("a[href*='/ptr/']")
+                                if links.count() > 0:
+                                    href = links.first.get_attribute("href")
+                                    doc_id_m = re.search(r"/ptr/([^/]+)", href)
+                                    if doc_id_m:
+                                        doc_id = doc_id_m.group(1)
+                                        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", row_text)
+                                        date_text = date_match.group(1) if date_match else None
+
+                                        # Construct full source URL
+                                        source_url = href if href.startswith("http") else (BASE_URL + href)
+
+                                        all_rows.append({
+                                            "doc_id": doc_id,
+                                            "filing_date": date_text,
+                                            "source_url": source_url,
+                                            "raw": {"text": row_text}
+                                        })
+                                        logging.debug("Found PTR filing: %s", doc_id)
+                        except Exception:
+                            logging.exception("Error scraping page %d", page_num)
+
+                        # Check if there's a "Next" button and if it's enabled
+                        next_button = page.locator(".dataTables_paginate .paginate_button.next:not(.disabled)")
+
+                        if next_button.count() == 0:
+                            logging.info("No more pages (Next button not found or disabled)")
+                            break
+
+                        # Click Next
+                        try:
+                            next_button.click()
+                            page.wait_for_load_state("networkidle")
+                            page_num += 1
+                        except Exception:
+                            logging.exception("Failed to click Next button")
+                            break
+
+                    logging.info("Found %d total PTR filings across %d pages", len(all_rows), page_num)
                     cookies = page.context.cookies()
                     browser.close()
-                    return enriched, cookies
-                except Exception:
-                    logging.exception("Failed to intercept XHR; falling back to server-side POST")
+                    return all_rows, cookies
             except Exception:
                 logging.exception("Error during XHR interception attempt")
 
@@ -290,10 +379,7 @@ def run_search(start_date: str, end_date: str):
                 return dt_str
 
             ajax_url = SEARCH_URL.rstrip("/") + "/report/data/"
-            payload = {
-                "draw": 1,
-                "start": 0,
-                "length": 1000,
+            base_payload = {
                 # Filters (DataTables expects JSON-encoded lists for these fields on the site)
                 "report_types": json.dumps([11]),  # Periodic Transactions
                 # Ensure at least one filer type is selected: 1=Senator,4=Candidate,5=Former Senator
@@ -307,54 +393,94 @@ def run_search(start_date: str, end_date: str):
                 "last_name": "",
             }
 
-            logging.info("AJAX payload (fallback): %s", payload)
-
-            logging.info("Performing server-side AJAX request for reports (fallback)")
-            try:
-                resp = sess.post(ajax_url, data=payload, headers=headers, timeout=30)
-                resp.raise_for_status()
-            except Exception:
-                logging.exception("AJAX request to report data endpoint failed (fallback)")
-                cookies = page.context.cookies()
-                browser.close()
-                return [], cookies
-
-            # Save raw JSON for debugging
-            try:
-                with open("debug_results_json.json", "w", encoding="utf-8") as fh:
-                    fh.write(resp.text)
-            except Exception:
-                pass
-
+            # Pagination loop: fetch all pages
             rows: list[dict] = []
-            try:
-                data = resp.json().get("data")
-            except Exception:
-                logging.error("Response not JSON or missing 'data' key (fallback)")
-                browser.close()
-                return rows
+            page_size = 100  # Max results per request (Senate portal supports 25, 50, 75, 100)
+            current_offset = 0
+            draw_counter = 1
+            total_records = None
 
-            # DataTables may return rows as arrays or HTML strings. Parse conservatively.
-            for item in data:
-                text_frag = ""
-                if isinstance(item, str):
-                    text_frag = item
-                elif isinstance(item, list):
-                    text_frag = " ".join([str(x) for x in item])
-                elif isinstance(item, dict):
-                    text_frag = " ".join([str(v) for v in item.values()])
+            logging.info("Starting paginated AJAX requests (fallback)")
 
-                # Look for link to the PTR view
-                m = re.search(r"/search/view/ptr/(\d+)", text_frag)
-                if not m:
-                    m = re.search(r"/view/ptr/(\d+)", text_frag)
-                if m:
-                    doc_id = m.group(1)
-                    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
-                    date_text = date_match.group(1) if date_match else None
-                    rows.append({"doc_id": str(doc_id), "filing_date": date_text, "raw": {"text": text_frag}})
+            while True:
+                payload = {
+                    **base_payload,
+                    "draw": draw_counter,
+                    "start": current_offset,
+                    "length": page_size,
+                }
 
-            logging.info("Found %d filings via fallback AJAX", len(rows))
+                logging.info("Fetching page: offset=%d, length=%d (draw=%d)", current_offset, page_size, draw_counter)
+
+                try:
+                    resp = sess.post(ajax_url, data=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                except Exception:
+                    logging.exception("AJAX request to report data endpoint failed (fallback)")
+                    break
+
+                # Save raw JSON for debugging (first page only)
+                if draw_counter == 1:
+                    try:
+                        with open("debug_results_json.json", "w", encoding="utf-8") as fh:
+                            fh.write(resp.text)
+                    except Exception:
+                        pass
+
+                try:
+                    json_response = resp.json()
+                    data = json_response.get("data")
+
+                    # Get total count from first response
+                    if total_records is None:
+                        total_records = json_response.get("recordsTotal", 0)
+                        logging.info("Total records available: %d", total_records)
+                except Exception:
+                    logging.error("Response not JSON or missing 'data' key (fallback)")
+                    break
+
+                if not data:
+                    logging.info("No more data in response, stopping pagination")
+                    break
+
+                # DataTables may return rows as arrays or HTML strings. Parse conservatively.
+                page_rows = 0
+                for item in data:
+                    text_frag = ""
+                    if isinstance(item, str):
+                        text_frag = item
+                    elif isinstance(item, list):
+                        text_frag = " ".join([str(x) for x in item])
+                    elif isinstance(item, dict):
+                        text_frag = " ".join([str(v) for v in item.values()])
+
+                    # Look for link to the PTR view (support both numeric and UUID formats)
+                    m = re.search(r"/search/view/ptr/([^/\"'<>\s]+)", text_frag)
+                    if not m:
+                        m = re.search(r"/view/ptr/([^/\"'<>\s]+)", text_frag)
+                    if m:
+                        doc_id = m.group(1)
+                        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
+                        date_text = date_match.group(1) if date_match else None
+                        rows.append({"doc_id": str(doc_id), "filing_date": date_text, "raw": {"text": text_frag}})
+                        page_rows += 1
+
+                logging.info("Parsed %d filings from this page (total so far: %d)", page_rows, len(rows))
+
+                # Check if we've reached the end
+                if total_records and len(rows) >= total_records:
+                    logging.info("Fetched all available records")
+                    break
+
+                if page_rows < page_size:
+                    logging.info("Received fewer results than page size, assuming last page")
+                    break
+
+                # Move to next page
+                current_offset += page_size
+                draw_counter += 1
+
+            logging.info("Found %d total filings via fallback AJAX across %d pages", len(rows), draw_counter)
             cookies = page.context.cookies()
             browser.close()
             return rows, cookies

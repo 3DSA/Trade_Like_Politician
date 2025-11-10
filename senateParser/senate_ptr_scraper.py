@@ -770,6 +770,19 @@ def main() -> None:
             html_content = item.get("html_content")
             source_url = item.get("source_url")
 
+            # If no HTML content but source_url is available, fetch it
+            if not html_content and source_url:
+                try:
+                    logging.info("Fetching HTML from source_url: %s", source_url)
+                    resp = scraper.session.get(source_url, timeout=30)
+                    resp.raise_for_status()
+                    html_content = resp.text
+                    logging.info("Fetched HTML content (%d bytes)", len(html_content))
+                except Exception as e:
+                    logging.error("Failed to fetch HTML from %s: %s", source_url, e)
+                    skipped += 1
+                    continue
+
             if not html_content:
                 logging.warning("Skipping filing %s: no HTML content available", doc_id)
                 skipped += 1
