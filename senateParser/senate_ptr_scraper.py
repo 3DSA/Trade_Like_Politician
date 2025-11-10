@@ -162,7 +162,8 @@ class SenateScraper:
                     results.append({
                         "doc_id": doc_id,
                         "filing_date": date_text,
-                        "pdf_url": None,
+                        "pdf_url": row.get("pdf_url"),  # Pass through enriched PDF URL (if available)
+                        "pdf_path": row.get("pdf_path"),  # Pass through generated PDF path (if available)
                         "raw": row.get("raw", {}),
                     })
                     continue
@@ -171,14 +172,17 @@ class SenateScraper:
                 href = row.get("href", "")
                 text = row.get("text", "")
                 if href and ("/search/view/ptr/" in href or "/view/ptr/" in href):
-                    m = re.search(r"(\d+)", href)
+                    # Extract doc_id from href - support both numeric and UUID formats
+                    # Examples: /view/ptr/123 or /view/ptr/f87f8a40-efa5-43df-ad71-56327f5a18ce
+                    m = re.search(r"/ptr/([^/]+)", href)
                     doc_id = m.group(1) if m else href
                     date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text)
                     date_text = date_match.group(1) if date_match else None
                     results.append({
                         "doc_id": str(doc_id),
                         "filing_date": date_text,
-                        "pdf_url": None,
+                        "pdf_url": row.get("pdf_url"),  # Pass through enriched PDF URL (if available)
+                        "pdf_path": row.get("pdf_path"),  # Pass through generated PDF path (if available)
                         "raw": {"href": href, "row_text": text},
                     })
                     
@@ -196,76 +200,122 @@ class SenateScraper:
         return results
 
 
-    def download_filing(self, doc_id: str, year: int) -> tuple[bytes, str]:
-        """Download a specific filing PDF and return its content and SHA256. Save debug file if not PDF."""
-        url = f"{DOWNLOAD_URL}{doc_id}"
-        try:
-            resp = self.session.get(url, timeout=30, allow_redirects=True)
-            resp.raise_for_status()
-        except requests.RequestException:
-            raise
+    def download_filing(self, doc_id: str, year: int, pdf_url: Optional[str] = None, pdf_path: Optional[str] = None) -> tuple[bytes, str]:
+        """Download a specific filing PDF and return its content and SHA256.
 
-        content: bytes
-        ctype = resp.headers.get("Content-Type", "")
+        Args:
+            doc_id: The filing document ID
+            year: Year for organizing downloaded files
+            pdf_url: Optional direct PDF URL from Playwright enrichment. If provided,
+                    this URL will be used instead of attempting to extract from view page.
+            pdf_path: Optional path to already-generated PDF from Playwright. If provided,
+                     the file will be read from this path instead of downloading.
+        """
         year_dir = self.samples_dir / str(year)
         year_dir.mkdir(parents=True, exist_ok=True)
         out_path = year_dir / f"{doc_id}.pdf"
 
-        if ctype.startswith("application/pdf"):
-            content = resp.content
-        else:
-            # Not a PDF: log warning, save debug file, and try to extract PDF link
-            logging.warning(f"Doc {doc_id}: Response is not PDF (Content-Type: {ctype})")
-            preview = resp.content[:200]
+        content: bytes
+
+        # If we already have a generated PDF from Playwright, use it
+        if pdf_path and Path(pdf_path).exists():
+            logging.info(f"Doc {doc_id}: Using pre-generated PDF from Playwright: {pdf_path}")
             try:
-                logging.warning(f"Doc {doc_id}: First 200 bytes: {preview!r}")
-            except Exception:
-                pass
-            debug_path = year_dir / f"debug_{doc_id}.bin"
-            with debug_path.open("wb") as fh:
-                fh.write(resp.content)
+                content = Path(pdf_path).read_bytes()
+                logging.info(f"Doc {doc_id}: Read PDF ({len(content)} bytes)")
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            iframe = soup.find("iframe")
-            pdf_href = None
-            if iframe and iframe.get("src") and ".pdf" in iframe.get("src"):
-                pdf_href = iframe.get("src")
-            else:
-                for a in soup.find_all("a", href=True):
-                    if ".pdf" in a["href"].lower():
-                        pdf_href = a["href"]
-                        break
+                # Verify it's a valid PDF
+                if not content.startswith(b'%PDF'):
+                    raise ValueError(f"File at {pdf_path} is not a valid PDF")
 
-            if pdf_href:
-                pdf_url = pdf_href if pdf_href.startswith("http") else f"{SENATE_BASE_URL}{pdf_href}"
-                pdf_resp = self.session.get(pdf_url, timeout=30)
-                pdf_resp.raise_for_status()
-                content = pdf_resp.content
-                # If this is not a PDF, save debug file
-                pdf_ctype = pdf_resp.headers.get("Content-Type", "")
-                if not pdf_ctype.startswith("application/pdf"):
-                    logging.warning(f"Doc {doc_id}: Fallback PDF link is not PDF (Content-Type: {pdf_ctype})")
-                    debug_pdf_path = year_dir / f"debug_{doc_id}_fallback.bin"
-                    with debug_pdf_path.open("wb") as fh:
-                        fh.write(pdf_resp.content)
-            else:
-                # fallback: return HTML bytes
+            except Exception as exc:
+                logging.error(f"Doc {doc_id}: Failed to read pre-generated PDF: {exc}")
+                raise
+        # If we have a direct PDF URL from Playwright, use it
+        elif pdf_url:
+            logging.info(f"Doc {doc_id}: Using direct PDF URL from Playwright: {pdf_url}")
+            try:
+                resp = self.session.get(pdf_url, timeout=30, allow_redirects=True)
+                resp.raise_for_status()
+
+                ctype = resp.headers.get("Content-Type", "")
+                if ctype.startswith("application/pdf"):
+                    content = resp.content
+                    logging.info(f"Doc {doc_id}: Successfully downloaded PDF ({len(content)} bytes)")
+                else:
+                    logging.warning(f"Doc {doc_id}: Direct URL did not return PDF (Content-Type: {ctype})")
+                    # Save debug file
+                    debug_path = year_dir / f"debug_{doc_id}_direct.html"
+                    with debug_path.open("wb") as fh:
+                        fh.write(resp.content)
+                    raise ValueError(f"Direct PDF URL returned {ctype} instead of PDF")
+            except requests.RequestException as exc:
+                logging.error(f"Doc {doc_id}: Failed to download from direct PDF URL: {exc}")
+                raise
+        else:
+            # Fallback: try the view page endpoint (less reliable)
+            logging.warning(f"Doc {doc_id}: No direct PDF URL provided, trying view page endpoint")
+            url = f"{DOWNLOAD_URL}{doc_id}"
+            try:
+                resp = self.session.get(url, timeout=30, allow_redirects=True)
+                resp.raise_for_status()
+            except requests.RequestException:
+                raise
+
+            ctype = resp.headers.get("Content-Type", "")
+            if ctype.startswith("application/pdf"):
                 content = resp.content
+            else:
+                # Not a PDF: log warning, save debug file, and try to extract PDF link
+                logging.warning(f"Doc {doc_id}: Response is not PDF (Content-Type: {ctype})")
+                debug_path = year_dir / f"debug_{doc_id}.html"
+                with debug_path.open("wb") as fh:
+                    fh.write(resp.content)
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                iframe = soup.find("iframe")
+                pdf_href = None
+                if iframe and iframe.get("src") and ".pdf" in iframe.get("src"):
+                    pdf_href = iframe.get("src")
+                else:
+                    for a in soup.find_all("a", href=True):
+                        if ".pdf" in a["href"].lower():
+                            pdf_href = a["href"]
+                            break
+
+                if pdf_href:
+                    pdf_url_fallback = pdf_href if pdf_href.startswith("http") else f"{SENATE_BASE_URL}{pdf_href}"
+                    logging.info(f"Doc {doc_id}: Found PDF link in HTML: {pdf_url_fallback}")
+                    pdf_resp = self.session.get(pdf_url_fallback, timeout=30)
+                    pdf_resp.raise_for_status()
+                    content = pdf_resp.content
+
+                    # Verify it's actually a PDF
+                    pdf_ctype = pdf_resp.headers.get("Content-Type", "")
+                    if not pdf_ctype.startswith("application/pdf"):
+                        logging.warning(f"Doc {doc_id}: Fallback PDF link is not PDF (Content-Type: {pdf_ctype})")
+                        raise ValueError(f"Could not obtain valid PDF for doc_id {doc_id}")
+                else:
+                    # No PDF link found
+                    raise ValueError(f"Could not find PDF link for doc_id {doc_id}")
 
         sha256 = hashlib.sha256(content).hexdigest()
 
+        # Only write if new or content differs
         write_file = True
         if out_path.exists():
             try:
                 existing = out_path.read_bytes()
                 if hashlib.sha256(existing).hexdigest() == sha256:
                     write_file = False
+                    logging.info(f"Doc {doc_id}: File already exists with same SHA256, skipping write")
             except OSError:
                 write_file = True
 
         if write_file:
             with out_path.open("wb") as fh:
                 fh.write(content)
+            logging.info(f"Doc {doc_id}: Saved to {out_path}")
 
         return content, sha256
 
@@ -277,73 +327,6 @@ class SenateScraper:
         # TODO: Use pdfplumber to extract tables and lines. If tables are empty,
         # run Tesseract OCR on pages and re-parse text blocks.
         return []
-
-
-    def download_filing(self, doc_id: str, year: int) -> tuple[bytes, str]:
-        """Download a specific filing PDF and return its content and SHA256."""
-        # The view endpoint often either streams a PDF or contains a link to it.
-        url = f"{DOWNLOAD_URL}{doc_id}"
-        try:
-            resp = self.session.get(url, timeout=30, allow_redirects=True)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            raise
-
-        content = None
-
-        ctype = resp.headers.get("Content-Type", "")
-        if ctype.startswith("application/pdf"):
-            content = resp.content
-        else:
-            # Parse HTML page to find PDF link or embedded PDF
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # check for <iframe src="...pdf">
-            iframe = soup.find("iframe")
-            pdf_href = None
-            if iframe and iframe.get("src") and ".pdf" in iframe.get("src"):
-                pdf_href = iframe.get("src")
-            else:
-                # find first link with .pdf
-                for a in soup.find_all("a", href=True):
-                    if ".pdf" in a["href"].lower():
-                        pdf_href = a["href"]
-                        break
-
-            if pdf_href:
-                pdf_url = pdf_href if pdf_href.startswith("http") else f"{SENATE_BASE_URL}{pdf_href}"
-                pdf_resp = self.session.get(pdf_url, timeout=30)
-                pdf_resp.raise_for_status()
-                content = pdf_resp.content
-            else:
-                # As a fallback, treat the HTML body as bytes (not ideal)
-                content = resp.content
-
-        sha256 = hashlib.sha256(content).hexdigest()
-
-        # Save to samples dir
-        year_dir = self.samples_dir / str(year)
-        year_dir.mkdir(parents=True, exist_ok=True)
-        out_path = year_dir / f"{doc_id}.pdf"
-        # Only write if new or content differs
-        write_file = True
-        if out_path.exists():
-            try:
-                existing = out_path.read_bytes()
-                if hashlib.sha256(existing).hexdigest() == sha256:
-                    write_file = False
-            except OSError:
-                write_file = True
-
-        if write_file:
-            with out_path.open("wb") as fh:
-                fh.write(content)
-
-        return content, sha256
-
-    def extract_transactions(self, pdf_content: bytes) -> list[TransactionRow]:
-        """Extract transaction data from a filing PDF."""
-        # TODO: Implement PDF parsing with pdfplumber + OCR fallback
-        pass
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -425,6 +408,10 @@ def main() -> None:
             skipped += 1
             continue
 
+        # Extract pdf_url and pdf_path from Playwright enrichment (if available)
+        pdf_url = item.get("pdf_url")
+        pdf_path = item.get("pdf_path")
+
         # Determine year for saving; fall back to current year
         filing_date = item.get("filing_date") or item.get("date") or None
         year = None
@@ -447,14 +434,15 @@ def main() -> None:
         if year is None:
             year = date.today().year
 
-        logging.info("Processing doc_id=%s (year=%s)", doc_id, year)
+        logging.info("Processing doc_id=%s (year=%s, pdf_path=%s, pdf_url=%s)",
+                    doc_id, year, pdf_path or "not provided", pdf_url or "not provided")
 
         if args.dry_run:
             logging.info("Dry run: would download %s", doc_id)
             continue
 
         try:
-            content, sha = scraper.download_filing(doc_id, year)
+            content, sha = scraper.download_filing(doc_id, year, pdf_url=pdf_url, pdf_path=pdf_path)
             logging.info("Saved %s (sha256=%s)", doc_id, sha)
             downloaded += 1
         except Exception as exc:

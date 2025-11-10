@@ -8,6 +8,7 @@ import json
 
 HOME_URL = "https://efdsearch.senate.gov/search/home/"
 SEARCH_URL = "https://efdsearch.senate.gov/search/"
+BASE_URL = "https://efdsearch.senate.gov"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -185,48 +186,63 @@ def run_search(start_date: str, end_date: str):
 
                     logging.info("Found %d filings via intercepted XHR", len(rows))
 
-                    # Enrich rows by visiting each view page in the browser and extracting
-                    # a direct PDF link (iframe src or .pdf anchor). This ensures we have
-                    # an absolute pdf_url that can be fetched with requests.
+                    # Parse the XHR data and extract filing info
+                    # Data is array of arrays: [firstName, lastName, fullName, linkHTML, date]
+                    from pathlib import Path
+
+                    # Create samples directory for generated PDFs
+                    samples_dir = Path(__file__).parent / "samples" / "2025"
+                    samples_dir.mkdir(parents=True, exist_ok=True)
+
                     enriched = []
-                    for r in rows:
-                        href = r.get("href")
-                        pdf_url = None
-                        view_url = None
-                        try:
-                            if href:
-                                view_url = href if href.startswith("http") else (SEARCH_URL.rstrip("/") + href)
-                                logging.info("Visiting view page: %s", view_url)
-                                page.goto(view_url)
-                                page.wait_for_load_state("networkidle")
+                    for item in data:
+                        text_frag = ""
+                        if isinstance(item, str):
+                            text_frag = item
+                        elif isinstance(item, list):
+                            text_frag = " ".join([str(x) for x in item])
+                        elif isinstance(item, dict):
+                            text_frag = " ".join([str(v) for v in item.values()])
 
-                                # Try to find an iframe with a PDF
+                        # Extract href and doc_id
+                        href_m = re.search(r'href="([^"]+)"', text_frag)
+                        href = href_m.group(1) if href_m else None
+
+                        doc_id = None
+                        pdf_path = None
+                        if href and "/ptr/" in href:
+                            doc_id_m = re.search(r"/ptr/([^/\"]+)", href)
+                            doc_id = doc_id_m.group(1) if doc_id_m else None
+
+                            # Generate PDF from the view page
+                            if doc_id:
                                 try:
-                                    iframe = page.query_selector("iframe")
-                                    if iframe:
-                                        src = iframe.get_attribute("src")
-                                        if src and ".pdf" in src:
-                                            pdf_url = src if src.startswith("http") else (SEARCH_URL.rstrip("/") + src)
+                                    view_url = href if href.startswith("http") else (BASE_URL + href)
+                                    logging.info("Visiting view page: %s", view_url)
+                                    page.goto(view_url, timeout=30000)
+                                    page.wait_for_load_state("networkidle", timeout=30000)
+
+                                    # Generate PDF from the HTML page
+                                    pdf_file = samples_dir / f"{doc_id}.pdf"
+                                    page.pdf(path=str(pdf_file), format="Letter", print_background=True)
+                                    pdf_path = str(pdf_file)
+                                    logging.info("Generated PDF: %s", pdf_file)
                                 except Exception:
-                                    pass
+                                    logging.exception("Failed to generate PDF for %s", doc_id)
 
-                                # If no iframe PDF, look for a link to a PDF
-                                if not pdf_url:
-                                    try:
-                                        a = page.query_selector("a[href*='.pdf']")
-                                        if a:
-                                            ah = a.get_attribute("href")
-                                            if ah:
-                                                pdf_url = ah if ah.startswith("http") else (SEARCH_URL.rstrip("/") + ah)
-                                    except Exception:
-                                        pass
+                        # Extract date
+                        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
+                        date_text = date_match.group(1) if date_match else None
 
-                        except Exception:
-                            logging.exception("Failed to fetch view page for href=%s", href)
-
-                        r["view_url"] = view_url
-                        r["pdf_url"] = pdf_url
-                        enriched.append(r)
+                        if doc_id:
+                            enriched.append({
+                                "doc_id": doc_id,
+                                "href": href,
+                                "filing_date": date_text,
+                                "pdf_url": None,
+                                "pdf_path": pdf_path,
+                                "raw": {"text": text_frag}
+                            })
 
                     cookies = page.context.cookies()
                     browser.close()
