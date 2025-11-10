@@ -188,12 +188,6 @@ def run_search(start_date: str, end_date: str):
 
                     # Parse the XHR data and extract filing info
                     # Data is array of arrays: [firstName, lastName, fullName, linkHTML, date]
-                    from pathlib import Path
-
-                    # Create samples directory for generated PDFs
-                    samples_dir = Path(__file__).parent / "samples" / "2025"
-                    samples_dir.mkdir(parents=True, exist_ok=True)
-
                     enriched = []
                     for item in data:
                         text_frag = ""
@@ -209,12 +203,12 @@ def run_search(start_date: str, end_date: str):
                         href = href_m.group(1) if href_m else None
 
                         doc_id = None
-                        pdf_path = None
+                        html_content = None
                         if href and "/ptr/" in href:
                             doc_id_m = re.search(r"/ptr/([^/\"]+)", href)
                             doc_id = doc_id_m.group(1) if doc_id_m else None
 
-                            # Generate PDF from the view page
+                            # Fetch HTML from the view page
                             if doc_id:
                                 try:
                                     view_url = href if href.startswith("http") else (BASE_URL + href)
@@ -222,25 +216,24 @@ def run_search(start_date: str, end_date: str):
                                     page.goto(view_url, timeout=30000)
                                     page.wait_for_load_state("networkidle", timeout=30000)
 
-                                    # Generate PDF from the HTML page
-                                    pdf_file = samples_dir / f"{doc_id}.pdf"
-                                    page.pdf(path=str(pdf_file), format="Letter", print_background=True)
-                                    pdf_path = str(pdf_file)
-                                    logging.info("Generated PDF: %s", pdf_file)
+                                    # Get HTML content
+                                    html_content = page.content()
+                                    logging.info("Fetched HTML for doc_id: %s (%d bytes)", doc_id, len(html_content))
                                 except Exception:
-                                    logging.exception("Failed to generate PDF for %s", doc_id)
+                                    logging.exception("Failed to fetch HTML for %s", doc_id)
 
                         # Extract date
                         date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text_frag)
                         date_text = date_match.group(1) if date_match else None
 
                         if doc_id:
+                            view_url_full = href if href.startswith("http") else (BASE_URL + href)
                             enriched.append({
                                 "doc_id": doc_id,
                                 "href": href,
                                 "filing_date": date_text,
-                                "pdf_url": None,
-                                "pdf_path": pdf_path,
+                                "html_content": html_content,
+                                "source_url": view_url_full,
                                 "raw": {"text": text_frag}
                             })
 

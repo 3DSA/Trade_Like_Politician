@@ -28,6 +28,7 @@ import pdfplumber
 from tqdm import tqdm
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+import psycopg
 
 # Senate eFD portal base URL and endpoints
 SENATE_BASE_URL = "https://efdsearch.senate.gov"
@@ -100,10 +101,244 @@ class TransactionRow:
         }
 
 
+# HTML Parsing Functions
+def parse_amount_range(amount_str: str) -> tuple[Optional[float], Optional[float]]:
+    """Parse amount range string like '$1,001 - $15,000' into min/max floats."""
+    if not amount_str or amount_str.strip() == '--':
+        return None, None
+    cleaned = amount_str.replace('$', '').replace(',', '').strip()
+    parts = re.split(r'\s*-\s*', cleaned)
+    if len(parts) == 2:
+        try:
+            return float(parts[0]), float(parts[1])
+        except ValueError:
+            return None, None
+    return None, None
+
+
+def parse_date_str(date_str: str) -> Optional[date]:
+    """Parse date string in MM/DD/YYYY format."""
+    if not date_str or date_str.strip() == '--':
+        return None
+    date_str = date_str.strip()
+    for fmt in ('%m/%d/%Y', '%m/%d/%y'):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_filed_datetime(filed_str: str) -> tuple[Optional[date], Optional[str]]:
+    """Parse 'Filed 10/10/2025 @ 11:38 AM' into date and time."""
+    if not filed_str:
+        return None, None
+    match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})\s*@\s*(.+)', filed_str)
+    if match:
+        date_part = parse_date_str(match.group(1))
+        time_part = match.group(2).strip()
+        return date_part, time_part
+    return None, None
+
+
+def extract_name_parts(full_name_header: str) -> dict[str, Optional[str]]:
+    """Extract name parts from header like 'The Honorable John Boozman (Boozman, John)'."""
+    result = {
+        'prefix': None,
+        'first_name': None,
+        'middle_name': None,
+        'last_name': None,
+        'suffix': None,
+        'full_name': None
+    }
+    if not full_name_header:
+        return result
+
+    # Extract parenthetical part
+    paren_match = re.search(r'\(([^)]+)\)', full_name_header)
+    if paren_match:
+        result['full_name'] = paren_match.group(1).strip()
+        parts = paren_match.group(1).split(',')
+        if len(parts) >= 2:
+            last_part = parts[0].strip()
+            first_middle_part = parts[1].strip()
+            last_tokens = last_part.split()
+            if len(last_tokens) > 1 and last_tokens[-1] in ['Jr', 'Jr.', 'Sr', 'Sr.', 'II', 'III', 'IV']:
+                result['suffix'] = last_tokens[-1].rstrip('.,')
+                result['last_name'] = ' '.join(last_tokens[:-1])
+            else:
+                result['last_name'] = last_part
+            name_tokens = first_middle_part.split()
+            if len(name_tokens) >= 1:
+                result['first_name'] = name_tokens[0]
+            if len(name_tokens) >= 2:
+                result['middle_name'] = ' '.join(name_tokens[1:])
+
+    prefix_match = re.match(r'(The Honorable|Hon\.|Mr\.|Mrs\.|Ms\.|Dr\.)', full_name_header, re.IGNORECASE)
+    if prefix_match:
+        result['prefix'] = prefix_match.group(1)
+
+    return result
+
+
+def parse_transaction_counts(summary_text: str) -> dict[str, int]:
+    """Parse transaction summary like '(9 transactions total) 0 Self 9 Joint 0 Spouse 0 Dependent Child'."""
+    result = {
+        'total_transactions': 0,
+        'self_transactions': 0,
+        'joint_transactions': 0,
+        'spouse_transactions': 0,
+        'dependent_transactions': 0
+    }
+    if not summary_text:
+        return result
+
+    total_match = re.search(r'(\d+)\s+transactions?\s+total', summary_text, re.IGNORECASE)
+    if total_match:
+        result['total_transactions'] = int(total_match.group(1))
+
+    self_match = re.search(r'(\d+)\s+Self', summary_text)
+    if self_match:
+        result['self_transactions'] = int(self_match.group(1))
+
+    joint_match = re.search(r'(\d+)\s+Joint', summary_text)
+    if joint_match:
+        result['joint_transactions'] = int(joint_match.group(1))
+
+    spouse_match = re.search(r'(\d+)\s+Spouse', summary_text)
+    if spouse_match:
+        result['spouse_transactions'] = int(spouse_match.group(1))
+
+    dependent_match = re.search(r'(\d+)\s+Dependent\s+Child', summary_text)
+    if dependent_match:
+        result['dependent_transactions'] = int(dependent_match.group(1))
+
+    return result
+
+
+def parse_ptr_html(html_content: str, doc_id: str, source_url: str) -> dict[str, Any]:
+    """Parse Senate PTR HTML and return structured data."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    filing = {
+        'doc_id': doc_id,
+        'filing_type': 'ptr',
+        'parse_version': PARSER_VERSION,
+        'source_url': source_url,
+        'raw_payload': json.dumps({'html_length': len(html_content)})  # Store metadata instead of full HTML
+    }
+
+    transactions = []
+
+    # Extract report type from h1
+    h1 = soup.find('h1')
+    if h1:
+        h1_text = h1.get_text(strip=True)
+        filing['report_type'] = h1_text
+        year_match = re.search(r'for\s+(\d{1,2}/\d{1,2}/(\d{4}))', h1_text)
+        if year_match:
+            filing['filing_year'] = int(year_match.group(2))
+
+    # Extract member name
+    h2 = soup.find('h2', class_='filedReport')
+    if h2:
+        name_parts = extract_name_parts(h2.get_text(strip=True))
+        filing.update(name_parts)
+
+    # Extract filing date and time
+    filed_p = soup.find('p', class_='muted')
+    if filed_p:
+        strong = filed_p.find('strong')
+        if strong:
+            filing_date, filing_time = parse_filed_datetime(strong.get_text(strip=True))
+            filing['filing_date'] = filing_date
+            filing['filed_time'] = filing_time
+            if filing_date and not filing.get('filing_year'):
+                filing['filing_year'] = filing_date.year
+
+    # Check certification
+    cert_checkbox = soup.find('input', {'name': 'filing_certified'})
+    filing['certified'] = cert_checkbox and cert_checkbox.get('checked') == 'checked'
+
+    cert_labels = soup.find_all('label', class_='form-check-label')
+    if cert_labels:
+        filing['certification_text'] = '\\n'.join([label.get_text(strip=True) for label in cert_labels])
+
+    # Extract transaction counts
+    summary_list = soup.find('ul', class_='unstyled')
+    if summary_list:
+        counts = parse_transaction_counts(summary_list.get_text())
+        filing.update(counts)
+
+    # Extract transactions
+    table = soup.find('table', class_='table-striped')
+    if table:
+        tbody = table.find('tbody')
+        if tbody:
+            for row in tbody.find_all('tr'):
+                cells = row.find_all('td')
+                if len(cells) >= 9:
+                    tx = {}
+                    tx['tx_number'] = int(cells[0].get_text(strip=True))
+                    tx['tx_date'] = parse_date_str(cells[1].get_text(strip=True))
+                    tx['owner'] = cells[2].get_text(strip=True) or None
+
+                    ticker_link = cells[3].find('a')
+                    if ticker_link:
+                        tx['ticker'] = ticker_link.get_text(strip=True)
+                    else:
+                        ticker_text = cells[3].get_text(strip=True)
+                        tx['ticker'] = ticker_text if ticker_text != '--' else None
+
+                    asset_text = cells[4].get_text(strip=True)
+                    tx['asset_name'] = asset_text or None
+
+                    # Check for bond details
+                    bond_div = cells[4].find('div', class_='text-muted')
+                    if bond_div:
+                        bond_text = bond_div.get_text()
+                        rate_match = re.search(r'Rate/Coupon:\s*([^\n]+)', bond_text)
+                        if rate_match:
+                            tx['rate_coupon'] = rate_match.group(1).strip()
+                        maturity_match = re.search(r'Matures:\s*(\d{1,2}/\d{1,2}/\d{4})', bond_text)
+                        if maturity_match:
+                            tx['maturity_date'] = parse_date_str(maturity_match.group(1))
+
+                    tx['asset_type'] = cells[5].get_text(strip=True) or None
+                    tx['tx_type'] = cells[6].get_text(strip=True) or None
+
+                    amount_str = cells[7].get_text(strip=True)
+                    tx['amount_range'] = amount_str if amount_str != '--' else None
+                    tx['amount_min'], tx['amount_max'] = parse_amount_range(amount_str)
+
+                    comment_text = cells[8].get_text(strip=True)
+                    tx['comment'] = comment_text if comment_text != '--' else None
+                    tx['row_confidence'] = 1.0
+
+                    transactions.append(tx)
+
+    # Calculate parse quality
+    parse_quality = 1.0
+    if not filing.get('first_name') or not filing.get('last_name'):
+        parse_quality -= 0.2
+    if not filing.get('filing_date'):
+        parse_quality -= 0.2
+    if not transactions:
+        parse_quality -= 0.3
+    filing['parse_quality'] = max(0.0, parse_quality)
+
+    return {
+        'filing': filing,
+        'transactions': transactions
+    }
+
+
 class SenateScraper:
-    def __init__(self, samples_dir: Path):
+    def __init__(self, samples_dir: Path, db_url: Optional[str] = None):
         self.session = requests.Session()
         self.samples_dir = samples_dir
+        self.db_url = db_url
+        self.db_conn = None
         self._setup_session()
 
     def _setup_session(self):
@@ -114,6 +349,142 @@ class SenateScraper:
             "Accept-Language": "en-US,en;q=0.9",
         })
         # public access typically works; authentication can be added here if needed
+
+    def get_db_connection(self):
+        """Get or create database connection."""
+        if not self.db_url:
+            return None
+        if not self.db_conn or self.db_conn.closed:
+            self.db_conn = psycopg.connect(self.db_url)
+            logging.info("Connected to database")
+        return self.db_conn
+
+    def close_db_connection(self):
+        """Close database connection if open."""
+        if self.db_conn and not self.db_conn.closed:
+            self.db_conn.close()
+            logging.info("Database connection closed")
+
+    def insert_filing(self, filing_data: dict) -> Optional[int]:
+        """Insert filing into senate_filings table and return filing_id."""
+        conn = self.get_db_connection()
+        if not conn:
+            logging.warning("No database connection, skipping insert")
+            return None
+
+        insert_sql = """
+            INSERT INTO senate_filings (
+                doc_id, first_name, middle_name, last_name, suffix, full_name, prefix,
+                filing_type, report_type, filing_date, filed_time, filing_year,
+                certified, certification_text,
+                total_transactions, self_transactions, joint_transactions,
+                spouse_transactions, dependent_transactions,
+                parse_version, parse_quality, raw_payload, source_url,
+                parsed_at
+            ) VALUES (
+                %(doc_id)s, %(first_name)s, %(middle_name)s, %(last_name)s, %(suffix)s,
+                %(full_name)s, %(prefix)s, %(filing_type)s, %(report_type)s,
+                %(filing_date)s, %(filed_time)s, %(filing_year)s,
+                %(certified)s, %(certification_text)s,
+                %(total_transactions)s, %(self_transactions)s, %(joint_transactions)s,
+                %(spouse_transactions)s, %(dependent_transactions)s,
+                %(parse_version)s, %(parse_quality)s, %(raw_payload)s::jsonb, %(source_url)s,
+                NOW()
+            )
+            ON CONFLICT (doc_id) DO UPDATE SET
+                first_name = EXCLUDED.first_name,
+                middle_name = EXCLUDED.middle_name,
+                last_name = EXCLUDED.last_name,
+                suffix = EXCLUDED.suffix,
+                full_name = EXCLUDED.full_name,
+                prefix = EXCLUDED.prefix,
+                report_type = EXCLUDED.report_type,
+                filing_date = EXCLUDED.filing_date,
+                filed_time = EXCLUDED.filed_time,
+                filing_year = EXCLUDED.filing_year,
+                certified = EXCLUDED.certified,
+                certification_text = EXCLUDED.certification_text,
+                total_transactions = EXCLUDED.total_transactions,
+                self_transactions = EXCLUDED.self_transactions,
+                joint_transactions = EXCLUDED.joint_transactions,
+                spouse_transactions = EXCLUDED.spouse_transactions,
+                dependent_transactions = EXCLUDED.dependent_transactions,
+                parse_version = EXCLUDED.parse_version,
+                parse_quality = EXCLUDED.parse_quality,
+                raw_payload = EXCLUDED.raw_payload,
+                source_url = EXCLUDED.source_url,
+                parsed_at = NOW()
+            RETURNING filing_id;
+        """
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute(insert_sql, filing_data)
+                result = cur.fetchone()
+                filing_id = result[0] if result else None
+                conn.commit()
+                logging.info(f"Inserted/updated filing {filing_data['doc_id']} with filing_id={filing_id}")
+                return filing_id
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to insert filing {filing_data.get('doc_id')}: {e}")
+            return None
+
+    def insert_transactions(self, filing_id: int, doc_id: str, transactions: list[dict]) -> int:
+        """Insert transactions into senate_transactions table. Returns count of inserted rows."""
+        conn = self.get_db_connection()
+        if not conn:
+            logging.warning("No database connection, skipping transaction insert")
+            return 0
+
+        insert_sql = """
+            INSERT INTO senate_transactions (
+                filing_id, doc_id, tx_number, tx_date, owner, ticker,
+                asset_name, asset_type, rate_coupon, maturity_date,
+                tx_type, amount_range, amount_min, amount_max,
+                comment, row_confidence
+            ) VALUES (
+                %(filing_id)s, %(doc_id)s, %(tx_number)s, %(tx_date)s, %(owner)s, %(ticker)s,
+                %(asset_name)s, %(asset_type)s, %(rate_coupon)s, %(maturity_date)s,
+                %(tx_type)s, %(amount_range)s, %(amount_min)s, %(amount_max)s,
+                %(comment)s, %(row_confidence)s
+            )
+            ON CONFLICT (doc_id, tx_number) DO UPDATE SET
+                tx_date = EXCLUDED.tx_date,
+                owner = EXCLUDED.owner,
+                ticker = EXCLUDED.ticker,
+                asset_name = EXCLUDED.asset_name,
+                asset_type = EXCLUDED.asset_type,
+                rate_coupon = EXCLUDED.rate_coupon,
+                maturity_date = EXCLUDED.maturity_date,
+                tx_type = EXCLUDED.tx_type,
+                amount_range = EXCLUDED.amount_range,
+                amount_min = EXCLUDED.amount_min,
+                amount_max = EXCLUDED.amount_max,
+                comment = EXCLUDED.comment,
+                row_confidence = EXCLUDED.row_confidence;
+        """
+
+        inserted_count = 0
+        try:
+            with conn.cursor() as cur:
+                for tx in transactions:
+                    tx['filing_id'] = filing_id
+                    tx['doc_id'] = doc_id
+                    # Ensure all required fields have defaults
+                    tx.setdefault('rate_coupon', None)
+                    tx.setdefault('maturity_date', None)
+                    tx.setdefault('row_confidence', 1.0)
+                    cur.execute(insert_sql, tx)
+                    inserted_count += 1
+                conn.commit()
+                logging.info(f"Inserted/updated {inserted_count} transactions for filing {doc_id}")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to insert transactions for filing {doc_id}: {e}")
+            return 0
+
+        return inserted_count
 
     def search_filings(self, start_date: date, end_date: date) -> list[dict]:
         """Search for PTR filings within the given date range.
@@ -162,8 +533,8 @@ class SenateScraper:
                     results.append({
                         "doc_id": doc_id,
                         "filing_date": date_text,
-                        "pdf_url": row.get("pdf_url"),  # Pass through enriched PDF URL (if available)
-                        "pdf_path": row.get("pdf_path"),  # Pass through generated PDF path (if available)
+                        "html_content": row.get("html_content"),  # Pass through HTML content from Playwright
+                        "source_url": row.get("source_url"),  # Pass through source URL from Playwright
                         "raw": row.get("raw", {}),
                     })
                     continue
@@ -181,8 +552,8 @@ class SenateScraper:
                     results.append({
                         "doc_id": str(doc_id),
                         "filing_date": date_text,
-                        "pdf_url": row.get("pdf_url"),  # Pass through enriched PDF URL (if available)
-                        "pdf_path": row.get("pdf_path"),  # Pass through generated PDF path (if available)
+                        "html_content": row.get("html_content"),  # Pass through HTML content from Playwright
+                        "source_url": row.get("source_url"),  # Pass through source URL from Playwright
                         "raw": {"href": href, "row_text": text},
                     })
                     
@@ -387,69 +758,96 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    scraper = SenateScraper(args.samples_dir)
+    scraper = SenateScraper(args.samples_dir, db_url=args.db_url)
     filings = scraper.search_filings(args.start_date, args.end_date)
-    
+
     if not filings:
         logging.info("No new filings found for date range.")
         return
 
     logging.info("Found %d filings to process.", len(filings))
     total = 0
-    downloaded = 0
+    parsed = 0
     skipped = 0
     failed = 0
 
-    for item in filings:
-        total += 1
-        doc_id = str(item.get("doc_id") or item.get("DocID") or item.get("raw", {}).get("id") or "")
-        if not doc_id:
-            logging.warning("Skipping filing with missing doc_id: %r", item)
-            skipped += 1
-            continue
+    try:
+        for item in filings:
+            total += 1
+            doc_id = str(item.get("doc_id") or item.get("DocID") or item.get("raw", {}).get("id") or "")
+            if not doc_id:
+                logging.warning("Skipping filing with missing doc_id: %r", item)
+                skipped += 1
+                continue
 
-        # Extract pdf_url and pdf_path from Playwright enrichment (if available)
-        pdf_url = item.get("pdf_url")
-        pdf_path = item.get("pdf_path")
+            # Extract HTML content and source URL from Playwright enrichment
+            html_content = item.get("html_content")
+            source_url = item.get("source_url")
 
-        # Determine year for saving; fall back to current year
-        filing_date = item.get("filing_date") or item.get("date") or None
-        year = None
-        try:
-            if filing_date:
-                if isinstance(filing_date, str):
-                    # try ISO or common formats
-                    try:
-                        year = datetime.strptime(filing_date, "%Y-%m-%d").year
-                    except ValueError:
-                        try:
-                            year = datetime.strptime(filing_date, "%m/%d/%Y").year
-                        except ValueError:
-                            year = date.today().year
-                elif isinstance(filing_date, (datetime, date)):
-                    year = filing_date.year
-        except Exception:
-            year = date.today().year
+            if not html_content:
+                logging.warning("Skipping filing %s: no HTML content available", doc_id)
+                skipped += 1
+                continue
 
-        if year is None:
-            year = date.today().year
+            logging.info("Processing doc_id=%s (source_url=%s)", doc_id, source_url or "not provided")
 
-        logging.info("Processing doc_id=%s (year=%s, pdf_path=%s, pdf_url=%s)",
-                    doc_id, year, pdf_path or "not provided", pdf_url or "not provided")
+            if args.dry_run:
+                logging.info("Dry run: would parse and insert %s", doc_id)
+                continue
 
-        if args.dry_run:
-            logging.info("Dry run: would download %s", doc_id)
-            continue
+            try:
+                # Parse HTML into structured data
+                parsed_data = parse_ptr_html(html_content, doc_id, source_url or "")
+                filing_data = parsed_data['filing']
+                transactions = parsed_data['transactions']
 
-        try:
-            content, sha = scraper.download_filing(doc_id, year, pdf_url=pdf_url, pdf_path=pdf_path)
-            logging.info("Saved %s (sha256=%s)", doc_id, sha)
-            downloaded += 1
-        except Exception as exc:
-            logging.warning("Failed to download %s: %s", doc_id, exc)
-            failed += 1
+                logging.info("Parsed filing %s: %d transactions, parse_quality=%.2f",
+                            doc_id, len(transactions), filing_data.get('parse_quality', 0.0))
 
-    logging.info("Done. total=%d downloaded=%d skipped=%d failed=%d", total, downloaded, skipped, failed)
+                # Insert into database if db_url is provided
+                if args.db_url:
+                    # Ensure all required fields have defaults
+                    filing_data.setdefault('first_name', None)
+                    filing_data.setdefault('middle_name', None)
+                    filing_data.setdefault('last_name', None)
+                    filing_data.setdefault('suffix', None)
+                    filing_data.setdefault('full_name', None)
+                    filing_data.setdefault('prefix', None)
+                    filing_data.setdefault('report_type', None)
+                    filing_data.setdefault('filing_date', None)
+                    filing_data.setdefault('filed_time', None)
+                    filing_data.setdefault('filing_year', date.today().year)
+                    filing_data.setdefault('certified', False)
+                    filing_data.setdefault('certification_text', None)
+                    filing_data.setdefault('total_transactions', 0)
+                    filing_data.setdefault('self_transactions', 0)
+                    filing_data.setdefault('joint_transactions', 0)
+                    filing_data.setdefault('spouse_transactions', 0)
+                    filing_data.setdefault('dependent_transactions', 0)
+                    filing_data.setdefault('parse_version', PARSER_VERSION)
+                    filing_data.setdefault('parse_quality', 0.0)
+
+                    filing_id = scraper.insert_filing(filing_data)
+                    if filing_id and transactions:
+                        tx_count = scraper.insert_transactions(filing_id, doc_id, transactions)
+                        logging.info("Inserted filing %s (filing_id=%d) with %d transactions", doc_id, filing_id, tx_count)
+                    elif filing_id:
+                        logging.info("Inserted filing %s (filing_id=%d) with no transactions", doc_id, filing_id)
+                    else:
+                        logging.warning("Failed to insert filing %s", doc_id)
+                        failed += 1
+                        continue
+
+                parsed += 1
+
+            except Exception as exc:
+                logging.exception("Failed to parse/insert %s: %s", doc_id, exc)
+                failed += 1
+
+    finally:
+        scraper.close_db_connection()
+
+    logging.info("Done. total=%d parsed=%d skipped=%d failed=%d", total, parsed, skipped, failed)
 
 if __name__ == "__main__":
     main()

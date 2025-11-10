@@ -3,7 +3,7 @@
 # Core HTTP and session management for Senate portal login and scraping
 requests==2.31.0
 beautifulsoup4==4.12.2
-playwright==1.39.0  # For browser automation and form handling
+playwright
 
 # PDF parsing and OCR tools
 pdfplumber==0.10.3
