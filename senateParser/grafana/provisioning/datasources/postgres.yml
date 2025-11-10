@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: Senate Trading DB
+    type: postgres
+    uid: senate_db
+    url: postgres:5432
+    user: tlp
+    secureJsonData:
+      password: 'tlp_password'
+    jsonData:
+      database: 'tlp_senate'
+      sslmode: 'disable'
+      postgresVersion: 1600
+    isDefault: true
+    editable: false

@@ -448,21 +448,7 @@ class SenateScraper:
                 %(asset_name)s, %(asset_type)s, %(rate_coupon)s, %(maturity_date)s,
                 %(tx_type)s, %(amount_range)s, %(amount_min)s, %(amount_max)s,
                 %(comment)s, %(row_confidence)s
-            )
-            ON CONFLICT (doc_id, tx_number) DO UPDATE SET
-                tx_date = EXCLUDED.tx_date,
-                owner = EXCLUDED.owner,
-                ticker = EXCLUDED.ticker,
-                asset_name = EXCLUDED.asset_name,
-                asset_type = EXCLUDED.asset_type,
-                rate_coupon = EXCLUDED.rate_coupon,
-                maturity_date = EXCLUDED.maturity_date,
-                tx_type = EXCLUDED.tx_type,
-                amount_range = EXCLUDED.amount_range,
-                amount_min = EXCLUDED.amount_min,
-                amount_max = EXCLUDED.amount_max,
-                comment = EXCLUDED.comment,
-                row_confidence = EXCLUDED.row_confidence;
+            );
         """
 
         inserted_count = 0
