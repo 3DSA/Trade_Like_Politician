@@ -21,7 +21,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# Note: Only ignore Python lib, not frontend/lib
+**/venv/lib/
+**/env/lib/
+**/.venv/lib/
 lib64/
 parts/
 sdist/
