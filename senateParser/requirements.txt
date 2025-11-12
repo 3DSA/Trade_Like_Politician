@@ -1,0 +1,19 @@
+# pip install -r senateParser/requirements.txt
+
+# Core HTTP and session management for Senate portal login and scraping
+requests==2.31.0
+beautifulsoup4==4.12.2
+playwright
+
+# PDF parsing and OCR tools
+pdfplumber==0.10.3
+pytesseract==0.3.10
+
+# PostgreSQL client (binary includes native libs, good for local dev)
+psycopg[binary]==3.1.18
+
+# Environment variable management for credentials
+python-dotenv==1.0.0
+
+# Progress bars for downloads
+tqdm==4.66.1

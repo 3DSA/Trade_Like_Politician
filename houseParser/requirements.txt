@@ -1,0 +1,9 @@
+# pip install -r houseParser/requirements.txt
+# Core HTTP client for downloading filing ZIP archives
+requests==2.31.0
+
+# PostgreSQL client (binary includes native libs, good for local dev)
+psycopg[binary]==3.1.18
+
+# Environment variable management for local credentials
+python-dotenv==1.0.0

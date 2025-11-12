@@ -1,0 +1,44 @@
+# Basic Postgres service for local development
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+services:
+  postgres:
+    image: postgres:16
+    container_name: tlp-senate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tlp
+      POSTGRES_PASSWORD: tlp_password
+      POSTGRES_DB: tlp_senate
+    ports:
+      - "5433:5432"  # Note: Using 5433 to avoid conflict with House Parser DB
+    volumes:
+      - ./db-data:/var/lib/postgresql/data
+    networks:
+      - tlp-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tlp-senate-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - postgres
+    networks:
+      - tlp-network
+
+networks:
+  tlp-network:
+    driver: bridge
+
+volumes:
+  grafana-data:
